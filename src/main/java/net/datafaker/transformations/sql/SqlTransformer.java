@@ -11,14 +11,15 @@ import net.datafaker.transformations.Transformer;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.StringJoiner;
 import java.util.stream.Stream;
 
 import static net.datafaker.transformations.sql.SqlTransformer.SQLKeyWords.ARRAY;
 import static net.datafaker.transformations.sql.SqlTransformer.SQLKeyWords.INSERT_INTO;
+import static net.datafaker.transformations.sql.SqlTransformer.SQLKeyWords.MAP;
 import static net.datafaker.transformations.sql.SqlTransformer.SQLKeyWords.MULTISET;
 import static net.datafaker.transformations.sql.SqlTransformer.SQLKeyWords.NULL;
-import static net.datafaker.transformations.sql.SqlTransformer.SQLKeyWords.ROW;
 import static net.datafaker.transformations.sql.SqlTransformer.SQLKeyWords.VALUES;
 
 public class SqlTransformer<IN> implements Transformer<IN, CharSequence> {
@@ -89,23 +90,33 @@ public class SqlTransformer<IN> implements Transformer<IN, CharSequence> {
         if (withBatchMode) {
             if (rowId == 0 || batchSize > 0 && rowId % batchSize == 0) {
                 return SqlDialect.getFirstRow(
-                    dialect, () -> appendTableInfo(fields), () -> addValues(input, fields), keywordCase);
+                    dialect, () -> appendTableInfo(fields), () -> addValues(input, fields, true), keywordCase);
             } else {
                 return String.join(LINE_SEPARATOR, ",",
                     SqlDialect.getOtherRow(
-                        dialect, () -> appendTableInfo(fields), () -> addValues(input, fields), keywordCase));
+                        dialect, () -> appendTableInfo(fields), () -> addValues(input, fields, true), keywordCase));
             }
         } else {
             return String.join(" ", INSERT_INTO.getValue(keywordCase),
                 appendTableInfo(fields),
                 VALUES.getValue(keywordCase),
-                addValues(input, fields));
+                addValues(input, fields, true));
         }
     }
 
-    private String addValues(IN input, Field<?, ? extends CharSequence>[] fields) {
+    private String addValues(IN input, Field<?, ? extends CharSequence>[] fields, Boolean isRoot) {
         StringJoiner result = new StringJoiner(", ");
         for (int i = 0; i < fields.length; i++) {
+
+            if(dialect != null) {
+                String fieldPrefix =
+                    dialect.getFieldPrefix(fields[i].getName());
+
+                if (!fieldPrefix.isEmpty() && !isRoot) {
+                    result.add(quote + dialect.getFieldPrefix(fields[i].getName()) + quote);
+                }
+            }
+
             if (fields[i] instanceof SimpleField) {
                 //noinspection unchecked
                 Object value = ((SimpleField<Object, ? extends CharSequence>) fields[i]).transform(input);
@@ -117,10 +128,12 @@ public class SqlTransformer<IN> implements Transformer<IN, CharSequence> {
                     result.add(String.valueOf(value));
                 } else if (clazz.isArray()) {
                     final Class<?> componentType = clazz.getComponentType();
-                    result.add(ARRAY.getValue(keywordCase) + "[" +
+                    result.add(ARRAY.getValue(keywordCase) + dialect.getArrayStart() +
                         (componentType.isPrimitive()
                             ? handlePrimitivesInArray(componentType, value)
-                            : handleObjectInArray(value)) + "]");
+                            : handleObjectInArray(value)) + dialect.getArrayEnd());
+                } else if (value instanceof Map) {
+                    result.add(MAP.getValue(keywordCase) + "(" + handleObjectInMap(value) + ")");
                 } else if (value instanceof Collection) {
                     result.add(MULTISET.getValue(keywordCase) + "[" +
                         handleObjectInCollection(value) + "]");
@@ -128,7 +141,7 @@ public class SqlTransformer<IN> implements Transformer<IN, CharSequence> {
                     result.add(handleObject(value));
                 }
             } else if (fields[i] instanceof CompositeField) {
-                result.add(ROW.getValue(keywordCase) + addValues(input, ((CompositeField) fields[i]).getFields()));
+                result.add(dialect.getCompositePrefix(keywordCase) + addValues(input, ((CompositeField) fields[i]).getFields(), false));
             } else {
                 throw new IllegalArgumentException(fields[i] + " not supported");
             }
@@ -163,6 +176,23 @@ public class SqlTransformer<IN> implements Transformer<IN, CharSequence> {
         return result.toString();
     }
 
+    private String handleObjectInMap(Object value) {
+        StringBuilder result = new StringBuilder();
+        Map<Object, Object> map = (Map<Object, Object>) value;
+        int i = 0;
+        for (Map.Entry<Object, Object> entry : map.entrySet()) {
+            result.append(handleObject(entry.getKey()));
+            result.append(", ");
+            result.append(handleObject(entry.getValue()));
+
+            if (i < map.size() - 1) {
+                result.append(", ");
+            }
+            i++;
+        }
+        return result.toString();
+    }
+
     private String handleObject(Object value) {
         if (value == null) {
             return NULL.getValue(keywordCase);
@@ -173,6 +203,8 @@ public class SqlTransformer<IN> implements Transformer<IN, CharSequence> {
                     ? handlePrimitivesInArray(componentType, value)
                     : handleObjectInArray(value);
                 return ARRAY.getValue(keywordCase) + "[" + array + "]";
+            } else if (value instanceof Map) {
+                return MAP.getValue(keywordCase) + "(" + handleObjectInMap(value) + ")";
             } else if (value instanceof Collection) {
                 return MULTISET.getValue(keywordCase)
                     + "[" + handleObjectInCollection(value) + "]";
@@ -337,12 +369,12 @@ public class SqlTransformer<IN> implements Transformer<IN, CharSequence> {
 
     @Override
     public String getStartStream(Schema<IN, ?> schema) {
-        throw new UnsupportedOperationException();
+        throw new UnsupportedOperationException("Not supported for SQL transformer. Use generate or generateStream instead to create SQL statements.");
     }
 
     @Override
     public String getEndStream() {
-        throw new UnsupportedOperationException();
+        throw new UnsupportedOperationException("Not supported for SQL transformer. Use generate or generateStream instead to create SQL statements.");
     }
 
     private String generateBatchModeStatements(Schema<IN, ?> schema, List<IN> inputs, int limit) {
@@ -360,6 +392,63 @@ public class SqlTransformer<IN> implements Transformer<IN, CharSequence> {
             }
         }
         return sb.toString();
+    }
+
+    /**
+     * Represents an interval of integers.
+     * Useful to capture range of rows corresponding to batch SQL statements.
+     *
+     * @see SqlTransformer#generateStream(Schema, long)
+     */
+    private static class Interval {
+        final Integer start;
+        final Integer end;
+
+        public Interval(Integer start, Integer end) {
+            this.start = start;
+            this.end = end;
+        }
+
+        public Interval add(Integer offset) {
+            return new Interval(start + offset, end + offset);
+        }
+
+        public Integer getStart() {
+            return start;
+        }
+
+        public Integer getEnd() {
+            return end;
+        }
+    }
+
+
+    @Override
+    public Stream<CharSequence> generateStream(final Schema<IN, ?> schema, long limit) {
+        if (schema.getFields().length == 0) {
+            return Stream.empty();
+        }
+
+        if (withBatchMode) {
+            return
+                Stream
+                    .iterate(new Interval(0, batchSize), interval -> interval.getStart() <= limit, i -> i.add(batchSize))
+                    .map(interval -> {
+                        StringBuilder sb = new StringBuilder();
+
+                        for (int i = interval.getStart(); i < interval.getEnd() && i < limit; i++) {
+                            sb.append(apply(null, schema, i));
+                        }
+                        sb.append(SqlDialect.getLastRowSuffix(dialect, keywordCase));
+                        sb.append(";");
+                        return sb.toString();
+                    });
+        } else {
+            return
+                Stream
+                    .generate(() -> (CharSequence) (apply(null, schema) + ";"))
+                    .limit(limit);
+        }
     }
 
     private String generateSeparatedStatements(Schema<IN, ?> schema, List<IN> inputs, int limit) {
@@ -459,6 +548,8 @@ public class SqlTransformer<IN> implements Transformer<IN, CharSequence> {
 
     enum SQLKeyWords {
         ARRAY("ARRAY", "array", "Array"),
+        MAP("MAP", "map", "Map"),
+        NAMED_STRUCT("NAMED_STRUCT", "named_struct", "Named_Struct"),
         INSERT_ALL("INSERT ALL", "insert all", "Insert All"),
         INSERT_INTO("INSERT INTO", "insert into", "Insert Into"),
         INTO("INTO", "into", "Into"),

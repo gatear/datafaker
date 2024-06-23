@@ -13,8 +13,12 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static net.datafaker.transformations.Field.compositeField;
@@ -25,6 +29,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.params.provider.Arguments.of;
 
 class SqlTest {
+
     @Test
     void generateFromFakeSequenceSeparated() {
         BaseFaker faker = new BaseFaker(new Random(10L));
@@ -443,5 +448,113 @@ class SqlTest {
                         compositeField("row", new Field[]{field("name", () -> new int[]{1, 2, 3})})})),
                 null, "INSERT INTO \"MyTable\" (\"row_array\") VALUES (ROW('1', ROW(ARRAY[1, 2, 3])));")
         );
+    }
+
+
+    @Test
+    void batchTestForSqlTransformerSparkSql() {
+        SqlTransformer<String> transformer =
+            SqlTransformer.<String>builder()
+                .dialect(SqlDialect.SPARKSQL)
+                .batch()
+                .build();
+
+        assertThatThrownBy(() -> transformer.generate(Schema.of(field("ints", () -> new int[]{1, 2})), 1))
+            .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+
+    @ParameterizedTest
+    @MethodSource("generateTestSchemaForSparkSql")
+    void simpleSqlTestForSqlTransformerSparkSql(Schema<String, String> schema, String tableSchemaName, String expected) {
+        SqlTransformer<String> transformer =
+            SqlTransformer.<String>builder()
+                .schemaName(tableSchemaName)
+                .dialect(SqlDialect.SPARKSQL)
+                .build();
+
+        assertThat(transformer.generate(schema, 1)).isEqualTo(expected);
+    }
+
+    private static Stream<Arguments> generateTestSchemaForSparkSql() {
+
+        /*
+         * Maps must be ordered in order to have deterministic SQL statement.
+         */
+        Supplier<Map<String, String>> supplySmallMap =
+            () -> new TreeMap<>(Map.of("k1", "v1"));
+
+        Supplier<Map<String, Object>> supplyBigMap =
+            () -> new TreeMap<>(Map.of("k1", supplySmallMap.get(), "k2",  supplySmallMap.get()));
+        ;
+        return Stream.of(
+            of(Schema.of(), null, ""),
+            of(Schema.of(field("bytes", () -> new byte[]{1, 0})), null,
+                "INSERT INTO `MyTable` (`bytes`) VALUES (ARRAY(1, 0));"),
+            of(Schema.of(field("booleans", () -> new boolean[]{true, false})), null,
+                "INSERT INTO `MyTable` (`booleans`) VALUES (ARRAY(true, false));"),
+            of(Schema.of(field("ints", () -> new int[]{1, 2, 3})), "",
+                "INSERT INTO `MyTable` (`ints`) VALUES (ARRAY(1, 2, 3));"),
+            of(Schema.of(field("longs", () -> new long[]{23L, 45L})), null,
+                "INSERT INTO `MyTable` (`longs`) VALUES (ARRAY(23, 45));"),
+            of(Schema.of(field("empty_map", Map::of)), null,
+                "INSERT INTO `MyTable` (`empty_map`) VALUES (MAP());"),
+            of(Schema.of(field("maps", supplyBigMap)), null,
+                "INSERT INTO `MyTable` (`maps`) VALUES (MAP('k1', MAP('k1', 'v1'), 'k2', MAP('k1', 'v1')));"),
+            of(Schema.of(
+                compositeField("struct_array", new Field[]{field("name1", () -> "1"), compositeField("struct", new Field[]{field("name", () -> new int[]{1, 2, 3})})})), null,
+                "INSERT INTO `MyTable` (`struct_array`) VALUES (NAMED_STRUCT('name1', '1', 'struct', NAMED_STRUCT('name', ARRAY(1, 2, 3))));"),
+            of(Schema.of(
+                compositeField("struct_struct", new Field[]{field("name1", () -> "1"), compositeField("struct", new Field[]{field("name", () -> "2")})})), null,
+                "INSERT INTO `MyTable` (`struct_struct`) VALUES (NAMED_STRUCT('name1', '1', 'struct', NAMED_STRUCT('name', '2')));")
+        );
+    }
+
+
+    @ParameterizedTest
+    @MethodSource("generateTestSchemaForSparkSql")
+    void simpleStreamTestForSqlTransformerSparkSql(Schema<String, String> schema, String tableSchemaName, String expected) {
+        SqlTransformer<String> transformer =
+            SqlTransformer
+                .<String>builder()
+                .schemaName(tableSchemaName)
+                .dialect(SqlDialect.SPARKSQL).build();
+
+        String sql =
+            transformer
+                .generateStream(schema, 1)
+                .collect(Collectors.joining(LINE_SEPARATOR));
+
+        assertThat(sql).isEqualTo(expected);
+    }
+
+    @Test
+    void testSqlBatch() {
+        BaseFaker faker = new BaseFaker(new Random(10L));
+        Schema<Integer, ?> schema = Schema.of(
+            field("Number", () -> faker.number().digit()),
+            field("Password", () -> faker.internet().uuidv3())
+        );
+
+        SqlTransformer<Integer> transformer =
+            SqlTransformer
+                .<Integer>builder()
+                .batch(3)
+                .build();
+
+        String sql =
+            transformer
+                .generateStream(schema, 4)
+                .collect(Collectors.joining(LINE_SEPARATOR));
+
+        String expected =
+            "INSERT INTO \"MyTable\" (\"Number\", \"Password\")" + LINE_SEPARATOR +
+                "VALUES ('6', '09fd4007-40ba-39df-8cb1-65926bf7b8a9')," + LINE_SEPARATOR +
+                "       ('8', '96c19757-1f18-3051-9acb-f56f0b5555ae')," + LINE_SEPARATOR +
+                "       ('2', '8a4a0365-cd39-33c1-a52a-279b1076cf2d');" + LINE_SEPARATOR +
+                "INSERT INTO \"MyTable\" (\"Number\", \"Password\")" + LINE_SEPARATOR +
+                "VALUES ('6', 'e807efdd-b6db-319d-8342-a044274d3417');";
+
+        assertThat(sql).isEqualTo(expected);
     }
 }
